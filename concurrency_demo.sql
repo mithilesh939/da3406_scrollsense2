@@ -1,0 +1,103 @@
+-- concurrency_demo.sql  (Assignment 2, Task 5)
+-- Two connections, A and B. Open two sqlite3 shells on the SAME database file and type the steps in the order of the
+-- step numbers. The same steps are run for real, with two connections and forced timing, by:  python concurrency_demo.py
+-- (the real output of that run is pasted in plan_analysis.md). The demo database is built from schema.sql:
+--     python concurrency_demo.py        (creates concurrency_demo.db, WAL mode)
+-- In each shell first run:
+--     PRAGMA journal_mode;      -- must say: wal
+--     PRAGMA foreign_keys = ON;
+--     .timeout 0                -- B fails at once when it cannot get the write lock (use .timeout 5000 to make it wait)
+
+-- ==========================================================================================================
+-- 5.1  A1 transaction T2 (moderation decision). Schedule:  W_A(E)  R_B(E)  W_B(E)->busy  C_A  R_B(E)
+-- E = table VideoModerationEvent.  Only conflicting pair: R_B(E) then W_A(E) (B read the old row)  =>  edge B -> A.
+-- The precedence graph has two nodes and one edge, no cycle: conflict-serializable, serial order B then A.
+--
+--  step | Connection A                                         | Connection B
+--  -----+------------------------------------------------------+--------------------------------------------
+--   1   | BEGIN;                                               |
+--   2   | INSERT INTO VideoModerationEvent (video_id, state,   |
+--       |   decided_by_type, decided_by_id, decided_at)        |
+--       |   VALUES (1,'taken_down','reviewer',NULL,            |
+--       |           '2026-09-01T00:00:00Z');                   |
+--   3   |                                                      | SELECT state FROM VideoModerationEvent
+--       |                                                      |   WHERE video_id = 1
+--       |                                                      |   ORDER BY decided_at DESC, event_id DESC LIMIT 1;
+--       |                                                      |   -- returns 'live' (A is not committed)
+--   4   |                                                      | INSERT INTO VideoModerationEvent (video_id, state,
+--       |                                                      |   decided_by_type, decided_by_id, decided_at)
+--       |                                                      |   VALUES (1,'demoted','classifier',NULL,'2026-09-02T00:00:00Z');
+--       |                                                      |   -- Error: database is locked (A holds the write lock)
+--   5   | COMMIT;                                              |
+--   6   |                                                      | (repeat the SELECT of step 3) -- now 'taken_down'
+
+-- ==========================================================================================================
+-- 5.2  NEW interleaving on this schema: the Handle change limit (rule of A1 transaction T3: at most 2 changes).
+-- Setup (user 20 already made ONE change, so one more is allowed):
+--     INSERT INTO Handle VALUES (20,'first' ,'2026-01-01T00:00:00Z','2026-03-01T00:00:00Z');
+--     INSERT INTO Handle VALUES (20,'second','2026-03-01T00:00:00Z',NULL);
+-- Check used by both connections (changes made = rows - 1):
+--     SELECT COUNT(*) - 1 FROM Handle WHERE user_id = 20;          -- 1, so allowed (limit 2)
+-- Schedule:  R_A(H)  R_B(H)  W_A(H)  C_A  W_B(H)  C_B        H = rows of Handle for user 20
+-- Conflicts: R_A(H) before W_B(H) => A -> B ;  R_B(H) before W_A(H) => B -> A.   Cycle => NOT conflict-serializable.
+-- Anomaly: write skew (a check-then-write race, also called a phantom on the predicate "user 20 rows").
+-- Result: 3 changes although the limit is 2.
+
+-- 5.3a  BAD outcome: the check is done OUTSIDE the transaction.
+--  step | Connection A                                         | Connection B
+--  -----+------------------------------------------------------+--------------------------------------------
+--   1   | SELECT COUNT(*) - 1 FROM Handle WHERE user_id = 20;  |
+--       |   -- 1  -> allowed                                   |
+--   2   |                                                      | SELECT COUNT(*) - 1 FROM Handle WHERE user_id = 20;
+--       |                                                      |   -- 1  -> allowed
+--   3   | BEGIN;                                               |
+--       | UPDATE Handle SET ended_at = '2026-09-10T10:00:00Z'  |
+--       |   WHERE user_id = 20 AND ended_at IS NULL;           |
+--       | INSERT INTO Handle (user_id, handle, started_at, ended_at)
+--       |   VALUES (20,'handle_from_A','2026-09-10T10:00:00Z',NULL);
+--       | COMMIT;                                              |
+--   4   |                                                      | BEGIN;
+--       |                                                      | UPDATE Handle SET ended_at = '2026-09-10T10:00:05Z'
+--       |                                                      |   WHERE user_id = 20 AND ended_at IS NULL;
+--       |                                                      | INSERT INTO Handle (user_id, handle, started_at, ended_at)
+--       |                                                      |   VALUES (20,'handle_from_B','2026-09-10T10:00:05Z',NULL);
+--       |                                                      | COMMIT;
+--   5   | SELECT COUNT(*) - 1 FROM Handle WHERE user_id = 20;  -- 3 : LIMIT BROKEN
+
+-- 5.3b  Same race with a plain BEGIN (deferred) and the check INSIDE the transaction.
+--       SQLite itself stops it: B's snapshot is old, so B's first write fails with "database is locked"
+--       (SQLITE_BUSY_SNAPSHOT). B must ROLLBACK and retry; on the retry the check shows 2, so B refuses.
+--  step | Connection A                                         | Connection B
+--  -----+------------------------------------------------------+--------------------------------------------
+--   1   | BEGIN;                                               |
+--       | SELECT COUNT(*) - 1 FROM Handle WHERE user_id = 20;  |
+--   2   |                                                      | BEGIN;
+--       |                                                      | SELECT COUNT(*) - 1 FROM Handle WHERE user_id = 20;
+--   3   | UPDATE ... INSERT ... (as above);  COMMIT;          |
+--   4   |                                                      | UPDATE Handle SET ended_at = '2026-09-10T10:00:05Z'
+--       |                                                      |   WHERE user_id = 20 AND ended_at IS NULL;
+--       |                                                      |   -- Error: database is locked   (SQLITE_BUSY_SNAPSHOT)
+--   5   |                                                      | ROLLBACK;  BEGIN;  SELECT COUNT(*) - 1 ...;  -- 2: refuse; ROLLBACK;
+
+-- 5.3c  THE FIX: BEGIN IMMEDIATE (take the write lock first, then check, then write).
+--       Use  .timeout 5000  in shell B so that B waits for the lock.
+--  step | Connection A                                         | Connection B
+--  -----+------------------------------------------------------+--------------------------------------------
+--   1   | BEGIN IMMEDIATE;                                     |
+--       | SELECT COUNT(*) - 1 FROM Handle WHERE user_id = 20;  |
+--       |   -- 1 -> allowed                                    |
+--   2   |                                                      | BEGIN IMMEDIATE;   -- WAITS here (A holds the lock)
+--   3   | UPDATE Handle SET ended_at = '2026-09-10T10:00:00Z'  |
+--       |   WHERE user_id = 20 AND ended_at IS NULL;           |
+--       | INSERT INTO Handle (user_id, handle, started_at, ended_at)
+--       |   VALUES (20,'handle_from_A','2026-09-10T10:00:00Z',NULL);
+--       | COMMIT;                                              |   -- B gets the lock now
+--   4   |                                                      | SELECT COUNT(*) - 1 FROM Handle WHERE user_id = 20;
+--       |                                                      |   -- 2 -> limit reached: B does NOT write.
+--       |                                                      | ROLLBACK;
+--
+-- Cost of the fix, in two sentences:
+--   What waits: B waits at BEGIN IMMEDIATE for the whole time A holds the write lock, and EVERY writer waits, even one that
+--   would have touched another user (WAL has one writer at a time); readers never wait.
+--   What must retry: nothing has to retry with BEGIN IMMEDIATE (B just refuses cleanly), but with a plain BEGIN a loser must
+--   ROLLBACK and run the whole transaction again after the busy error. The measured numbers are in plan_analysis.md.
